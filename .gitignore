@@ -1,0 +1,6 @@
+ca.crt
+ca.key
+.code
+.vscode
+go.sum
+config.json

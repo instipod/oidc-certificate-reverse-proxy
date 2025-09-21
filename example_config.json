@@ -1,0 +1,27 @@
+{
+  "server": {
+    "port": "9443",
+    "cert_file": "server.crt",
+    "key_file": "server.key"
+  },
+  "upstream": {
+    "url": "http://server",
+    "insecure": false
+  },
+  "oidc": {
+    "issuer_url": "https://your-issuer-server/realms/default",
+    "client_id": "reverse-proxy",
+    "client_secret": "secret",
+    "redirect_url": "https://your-proxy:9443/auth/callback",
+    "scopes": ["openid", "profile", "email"]
+  },
+  "ca": {
+    "cert_file": "ca.crt",
+    "key_file": "ca.key"
+  },
+  "security": {
+    "cookie_secret": "your-32-byte-secret-key-here-1234",
+    "session_expiry": "24h",
+    "certificate_expiry": "1h"
+  }
+}
