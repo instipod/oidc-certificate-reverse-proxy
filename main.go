@@ -338,7 +338,12 @@ func (p *ProxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 		// Present the client certificate as a header instead of via mTLS, if configured
 		if p.config.Upstream.CertMode == "header" {
-			req.Header.Set(p.config.Upstream.CertHeaderName, certHeaderValue)
+			// Drop any client-supplied value first: direct map assignment below
+			// bypasses Header.Set's canonicalization, so a header the client sent
+			// under the canonical key (e.g. "Ssl_client_cert") would otherwise
+			// survive alongside ours under the literal configured key.
+			req.Header.Del(p.config.Upstream.CertHeaderName)
+			req.Header[p.config.Upstream.CertHeaderName] = []string{certHeaderValue}
 		}
 	}
 
@@ -589,7 +594,30 @@ func certToHeaderValue(cert *tls.Certificate) (string, error) {
 	}
 
 	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]})
-	return url.QueryEscape(string(pemBytes)), nil
+	return escapeURIComponent(string(pemBytes)), nil
+}
+
+// escapeURIComponent percent-encodes s per RFC 3986, leaving only unreserved
+// characters (A-Za-z0-9-._~) unescaped. This matches nginx's uri_component
+// escaping (used by $ssl_client_escaped_cert) exactly, unlike Go's
+// url.QueryEscape (form encoding, which emits '+' for space) or
+// url.PathEscape (which leaves '+', '=', etc. unescaped).
+func escapeURIComponent(s string) string {
+	const hex = "0123456789ABCDEF"
+	var b strings.Builder
+	b.Grow(len(s) * 3)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+			c == '-' || c == '.' || c == '_' || c == '~' {
+			b.WriteByte(c)
+			continue
+		}
+		b.WriteByte('%')
+		b.WriteByte(hex[c>>4])
+		b.WriteByte(hex[c&0xF])
+	}
+	return b.String()
 }
 
 // encryptCookie encrypts cookie data using AES-GCM
