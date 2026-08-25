@@ -561,7 +561,7 @@ func (p *ProxyServer) generateClientCert(session *Session, validity time.Duratio
 		Subject: pkix.Name{
 			CommonName: session.Username,
 		},
-		NotBefore:   time.Now().Add(time.Second * 2),
+		NotBefore:   time.Now().Add(-time.Minute),
 		NotAfter:    time.Now().Add(validity),
 		KeyUsage:    x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
