@@ -585,39 +585,21 @@ func (p *ProxyServer) generateClientCert(session *Session, validity time.Duratio
 	return newCert, nil
 }
 
-// certToHeaderValue PEM-encodes a client certificate's leaf and URL-encodes it
-// so it can be carried in a single HTTP header value, mirroring the convention
-// used by reverse proxies such as nginx's $ssl_client_escaped_cert.
+// certToHeaderValue PEM-encodes a client certificate's leaf with every newline
+// replaced by a single space, so it can be carried in one HTTP header value.
+// This matches the format WildFly/Undertow's SSLHeaderHandler expects for its
+// SSL_CLIENT_CERT reverse-proxy header (used by EJBCA's proxy-header port):
+// it reconstructs the PEM by swapping spaces back to newlines, so unlike
+// percent-encoding or embedded-newline folding, this produces a header value
+// containing only printable ASCII and spaces - no control characters - which
+// Go's net/http will happily send as-is.
 func certToHeaderValue(cert *tls.Certificate) (string, error) {
 	if len(cert.Certificate) == 0 {
 		return "", fmt.Errorf("certificate has no leaf")
 	}
 
 	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]})
-	return escapeURIComponent(string(pemBytes)), nil
-}
-
-// escapeURIComponent percent-encodes s per RFC 3986, leaving only unreserved
-// characters (A-Za-z0-9-._~) unescaped. This matches nginx's uri_component
-// escaping (used by $ssl_client_escaped_cert) exactly, unlike Go's
-// url.QueryEscape (form encoding, which emits '+' for space) or
-// url.PathEscape (which leaves '+', '=', etc. unescaped).
-func escapeURIComponent(s string) string {
-	const hex = "0123456789ABCDEF"
-	var b strings.Builder
-	b.Grow(len(s) * 3)
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
-			c == '-' || c == '.' || c == '_' || c == '~' {
-			b.WriteByte(c)
-			continue
-		}
-		b.WriteByte('%')
-		b.WriteByte(hex[c>>4])
-		b.WriteByte(hex[c&0xF])
-	}
-	return b.String()
+	return strings.ReplaceAll(string(pemBytes), "\n", " "), nil
 }
 
 // encryptCookie encrypts cookie data using AES-GCM
