@@ -244,34 +244,49 @@ func (p *ProxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	// Additional check: verify OAuth2 token expiry (separate from session expiry)
 	if session.Token != nil && !session.Token.Expiry.IsZero() && session.Token.Expiry.Before(time.Now()) {
-		// OAuth2 token expired, remove session and redirect to login
-		log.Printf("OAuth2 token expired for user %s", session.Username)
+		// OAuth2 token expired. Try a silent refresh using the refresh token
+		// before falling back to a full interactive re-auth, so an expired
+		// token doesn't interrupt an in-flight request.
+		refreshed, err := p.refreshSession(r.Context(), session)
+		if err != nil {
+			log.Printf("OAuth2 token refresh failed for user %s: %v", session.Username, err)
 
-		// Clean up expired session
-		cookieData, err := p.getEncryptedCookie(r)
-		if err == nil {
-			p.sessionMutex.Lock()
-			delete(p.sessions, cookieData.SessionID)
-			p.sessionMutex.Unlock()
+			// Clean up the session that could not be refreshed
+			cookieData, cerr := p.getEncryptedCookie(r)
+			if cerr == nil {
+				p.sessionMutex.Lock()
+				delete(p.sessions, cookieData.SessionID)
+				p.sessionMutex.Unlock()
+			}
+
+			loginURL := fmt.Sprintf("/auth/login?redirect=%s", url.QueryEscape(r.URL.RequestURI()))
+			http.Redirect(w, r, loginURL, http.StatusFound)
+			return
 		}
 
-		loginURL := fmt.Sprintf("/auth/login?redirect=%s", url.QueryEscape(r.URL.RequestURI()))
-		http.Redirect(w, r, loginURL, http.StatusFound)
-		return
+		log.Printf("OAuth2 token refreshed for user %s (expires: %s)", session.Username, refreshed.Token.Expiry.Format(time.RFC3339))
+		session = refreshed
 	}
 
 	// Determine the remaining validity period for the client certificate
 	// This will be the minimum of the session expiry and the OAuth token expiry
 	sessionRemaining := time.Until(session.ExpiresAt)
-	tokenRemaining := time.Until(session.Token.Expiry)
 
 	validity := sessionRemaining
-	if tokenRemaining < validity {
-		validity = tokenRemaining
+	if session.Token != nil && !session.Token.Expiry.IsZero() {
+		tokenRemaining := time.Until(session.Token.Expiry)
+		if tokenRemaining < validity {
+			validity = tokenRemaining
+		}
 	}
 	if validity > p.certificateExpiry {
 		// Limit the certificate validity to max specific, or shorter if the token/session says so
 		validity = p.certificateExpiry
+	}
+	if validity <= 0 {
+		http.Error(w, "Session has no remaining validity", http.StatusUnauthorized)
+		log.Printf("Computed non-positive certificate validity for user %s", session.Username)
+		return
 	}
 
 	// Generate or retrieve client certificate for upstream authentication
@@ -941,6 +956,50 @@ func (p *ProxyServer) handleLogout(w http.ResponseWriter, r *http.Request) {
 	})
 
 	fmt.Fprintf(w, "Logged out successfully")
+}
+
+// refreshSession attempts to silently renew an expired OAuth2 token using the
+// session's refresh token. On success, it updates the session in place (and
+// in the session store) with the new token, re-verifying and refreshing the
+// claims from the new ID token when the provider returns one. It also drops
+// any cached client certificate for the user, since a fresh one must be
+// issued to match the renewed token/session validity.
+func (p *ProxyServer) refreshSession(ctx context.Context, session *Session) (*Session, error) {
+	if session.Token == nil || session.Token.RefreshToken == "" {
+		return nil, fmt.Errorf("no refresh token available")
+	}
+
+	tokenSource := p.oauth2Config.TokenSource(ctx, session.Token)
+	newToken, err := tokenSource.Token()
+	if err != nil {
+		return nil, fmt.Errorf("refreshing token: %w", err)
+	}
+
+	claims := session.Claims
+	if rawIDToken, ok := newToken.Extra("id_token").(string); ok {
+		idToken, err := p.verifier.Verify(ctx, rawIDToken)
+		if err != nil {
+			return nil, fmt.Errorf("verifying refreshed ID token: %w", err)
+		}
+		var newClaims map[string]interface{}
+		if err := idToken.Claims(&newClaims); err != nil {
+			return nil, fmt.Errorf("extracting refreshed claims: %w", err)
+		}
+		claims = newClaims
+	}
+
+	p.sessionMutex.Lock()
+	session.Token = newToken
+	session.Claims = claims
+	p.sessionMutex.Unlock()
+
+	// The previously cached client certificate was scoped to the old token's
+	// validity window; drop it so generateClientCert issues a fresh one.
+	p.certCacheMutex.Lock()
+	delete(p.certCache, session.Username)
+	p.certCacheMutex.Unlock()
+
+	return session, nil
 }
 
 // getSession retrieves session from encrypted cookie and validates it
