@@ -6,7 +6,9 @@
   },
   "upstream": {
     "url": "http://server",
-    "insecure": false
+    "insecure": false,
+    "cert_mode": "tls",
+    "cert_header_name": "SSL_CLIENT_CERT"
   },
   "oidc": {
     "issuer_url": "https://your-issuer-server/realms/default",

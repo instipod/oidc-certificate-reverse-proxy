@@ -38,8 +38,10 @@ type Config struct {
 		KeyFile  string `json:"key_file"`
 	} `json:"server"`
 	Upstream struct {
-		URL      string `json:"url"`
-		Insecure bool   `json:"insecure"`
+		URL            string `json:"url"`
+		Insecure       bool   `json:"insecure"`
+		CertMode       string `json:"cert_mode"`        // "tls" (default) or "header"
+		CertHeaderName string `json:"cert_header_name"` // header name used when cert_mode is "header"
 	} `json:"upstream"`
 	OIDC struct {
 		IssuerURL    string   `json:"issuer_url"`
@@ -140,6 +142,15 @@ func loadConfig(filename string) (*Config, error) {
 	}
 	if config.Security.CertificateExpiry == "" {
 		config.Security.CertificateExpiry = "1h" // Default 1 hour
+	}
+	if config.Upstream.CertMode == "" {
+		config.Upstream.CertMode = "tls"
+	}
+	if config.Upstream.CertMode != "tls" && config.Upstream.CertMode != "header" {
+		return nil, fmt.Errorf("upstream.cert_mode must be \"tls\" or \"header\", got %q", config.Upstream.CertMode)
+	}
+	if config.Upstream.CertHeaderName == "" {
+		config.Upstream.CertHeaderName = "SSL_CLIENT_CERT"
 	}
 
 	return &config, nil
@@ -282,13 +293,28 @@ func (p *ProxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// Create reverse proxy
 	proxy := httputil.NewSingleHostReverseProxy(upstreamURL)
 
-	// Configure transport with client certificate
+	// Configure transport
+	tlsClientConfig := &tls.Config{
+		InsecureSkipVerify: p.config.Upstream.Insecure,
+	}
+	if p.config.Upstream.CertMode == "tls" {
+		// Present the generated certificate via mTLS to the upstream
+		// FIX: Dereference the pointer here
+		tlsClientConfig.Certificates = []tls.Certificate{*clientCert}
+	}
 	proxy.Transport = &http.Transport{
-		TLSClientConfig: &tls.Config{
-			// FIX: Dereference the pointer here
-			Certificates:       []tls.Certificate{*clientCert},
-			InsecureSkipVerify: p.config.Upstream.Insecure,
-		},
+		TLSClientConfig: tlsClientConfig,
+	}
+
+	var certHeaderValue string
+	if p.config.Upstream.CertMode == "header" {
+		var err error
+		certHeaderValue, err = certToHeaderValue(clientCert)
+		if err != nil {
+			http.Error(w, "Failed to encode client certificate", http.StatusInternalServerError)
+			log.Printf("Client cert header encoding error: %v", err)
+			return
+		}
 	}
 
 	// Modify request to add authenticated user header
@@ -309,6 +335,11 @@ func (p *ProxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 		// Add session info headers
 		req.Header.Set("X-Session-Expires", session.ExpiresAt.Format(time.RFC3339))
+
+		// Present the client certificate as a header instead of via mTLS, if configured
+		if p.config.Upstream.CertMode == "header" {
+			req.Header.Set(p.config.Upstream.CertHeaderName, certHeaderValue)
+		}
 	}
 
 	// Log the request
@@ -547,6 +578,18 @@ func (p *ProxyServer) generateClientCert(session *Session, validity time.Duratio
 	log.Printf("New certificate for user %s: Serial %s (expires %s)", session.Username, bi.String(), time.Now().Add(validity).Format(time.RFC3339))
 
 	return newCert, nil
+}
+
+// certToHeaderValue PEM-encodes a client certificate's leaf and URL-encodes it
+// so it can be carried in a single HTTP header value, mirroring the convention
+// used by reverse proxies such as nginx's $ssl_client_escaped_cert.
+func certToHeaderValue(cert *tls.Certificate) (string, error) {
+	if len(cert.Certificate) == 0 {
+		return "", fmt.Errorf("certificate has no leaf")
+	}
+
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]})
+	return url.QueryEscape(string(pemBytes)), nil
 }
 
 // encryptCookie encrypts cookie data using AES-GCM
